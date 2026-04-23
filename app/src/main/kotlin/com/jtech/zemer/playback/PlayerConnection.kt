@@ -8,6 +8,7 @@ import androidx.media3.common.Player.COMMAND_SEEK_IN_CURRENT_MEDIA_ITEM
 import androidx.media3.common.Player.COMMAND_SEEK_TO_NEXT_MEDIA_ITEM
 import androidx.media3.common.Player.COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM
 import androidx.media3.common.Player.REPEAT_MODE_OFF
+import androidx.media3.common.Player.REPEAT_MODE_ONE
 import androidx.media3.common.Player.STATE_ENDED
 import androidx.media3.common.Timeline
 import com.jtech.zemer.db.MusicDatabase
@@ -20,33 +21,55 @@ import com.jtech.zemer.playback.queues.Queue
 import com.jtech.zemer.utils.reportException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.ExperimentalCoroutinesApi
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.SharingStarted
-import kotlinx.coroutines.flow.combine
-import kotlinx.coroutines.flow.flatMapLatest
-import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.launch
+import org.fcast.sender_sdk.PlaybackState
+import org.fcast.sender_sdk.DeviceConnectionState
+import org.fcast.sender_sdk.Metadata
+import android.util.Log
+import org.fcast.sender_sdk.CastingDevice
+import org.fcast.sender_sdk.DeviceEventHandler
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class PlayerConnection(
     context: Context,
     binder: MusicBinder,
     val database: MusicDatabase,
-    scope: CoroutineScope,
+    val scope: CoroutineScope,
 ) : Player.Listener {
     val service = binder.service
     val player = service.player
 
     val playbackState = MutableStateFlow(player.playbackState)
     private val playWhenReady = MutableStateFlow(player.playWhenReady)
+
+    val isCasting = service.discoveryHandler.remoteConnectionState.map { connectionState: DeviceConnectionState ->
+        connectionState is org.fcast.sender_sdk.DeviceConnectionState.Connected
+    }.stateIn(scope, SharingStarted.Lazily, false)
+
     val isPlaying =
-        combine(playbackState, playWhenReady) { playbackState, playWhenReady ->
-            playWhenReady && playbackState != STATE_ENDED
+        combine(playbackState, playWhenReady, isCasting, service.discoveryHandler.remotePlaybackState) { playbackState, playWhenReady, casting, remoteState ->
+            if (casting && remoteState != null) {
+                remoteState.toString().contains("Playing", ignoreCase = true)
+            } else {
+                playWhenReady && playbackState != STATE_ENDED
+            }
         }.stateIn(
             scope,
             SharingStarted.Lazily,
             player.playWhenReady && player.playbackState != STATE_ENDED
         )
+
     val mediaMetadata = MutableStateFlow(player.currentMetadata)
+
+    val currentPosition = combine(isCasting, service.discoveryHandler.remoteTime, mediaMetadata) { casting, remoteTime, _ ->
+        if (casting) (remoteTime * 1000).toLong() else player.currentPosition
+    }.stateIn(scope, SharingStarted.Lazily, player.currentPosition)
+
+    val duration = combine(isCasting, service.discoveryHandler.remoteDuration, mediaMetadata) { casting, remoteDuration, _ ->
+        if (casting) (remoteDuration * 1000).toLong() else player.duration
+    }.stateIn(scope, SharingStarted.Lazily, player.duration)
+
     val currentSong =
         mediaMetadata.flatMapLatest {
             database.song(it?.id)
@@ -73,6 +96,9 @@ class PlayerConnection(
     val error = MutableStateFlow<PlaybackException?>(null)
     val waitingForNetworkConnection = service.waitingForNetworkConnection
 
+    private var lastTransitionTime = 0L
+    private var lastRemotePosition = 0.0
+
     init {
         player.addListener(this)
 
@@ -85,10 +111,44 @@ class PlayerConnection(
         currentMediaItemIndex.value = player.currentMediaItemIndex
         shuffleModeEnabled.value = player.shuffleModeEnabled
         repeatMode.value = player.repeatMode
+
+        service.discoveryHandler.onDisconnect = { lastRemotePos ->
+            player.seekTo(lastRemotePos)
+            player.prepare()
+            player.playWhenReady = false
+        }
+
+        scope.launch {
+            service.discoveryHandler.remoteTime.collect { time ->
+                if (time > 0) lastRemotePosition = time
+            }
+        }
+        scope.launch {
+            var lastState = service.discoveryHandler.remotePlaybackState.value
+            service.discoveryHandler.remotePlaybackState.collect { state ->
+                if (isCasting.value && state == PlaybackState.IDLE && lastState == PlaybackState.PLAYING) {
+                    val dur = service.discoveryHandler.remoteDuration.value
+                    // If we're near the end, transition to next song
+                    if (dur > 0 && lastRemotePosition >= dur - 2.0 && System.currentTimeMillis() - lastTransitionTime > 2000) {
+                        if (player.repeatMode == REPEAT_MODE_ONE) {
+                            player.seekTo(player.currentMediaItemIndex, 0)
+                            triggerRemoteLoad(player.currentMediaItem)
+                        } else if (canSkipNext.value) {
+                            seekToNext()
+                        }
+                    }
+                }
+                lastState = state
+            }
+        }
     }
 
     fun playQueue(queue: Queue) {
         service.playQueue(queue)
+        if (isCasting.value) {
+            player.pause()
+            triggerRemoteLoad(player.currentMediaItem)
+        }
     }
 
     fun startRadioSeamlessly() {
@@ -111,24 +171,57 @@ class PlayerConnection(
         service.toggleLike()
     }
 
+    fun playPause() {
+        if (isCasting.value) {
+            val remoteState = service.discoveryHandler.remotePlaybackState.value
+            if (remoteState != null && remoteState.toString().contains("Playing", ignoreCase = true)) {
+                service.discoveryHandler.pause()
+            } else {
+                service.discoveryHandler.play()
+            }
+        } else {
+            if (player.isPlaying) {
+                player.pause()
+            } else {
+                player.play()
+            }
+        }
+    }
+
+    fun seekTo(positionMs: Long) {
+        if (isCasting.value) {
+            service.discoveryHandler.seek(positionMs / 1000.0)
+        } else {
+            player.seekTo(positionMs)
+        }
+    }
+
     fun seekToNext() {
-        if (!player.currentTimeline.isEmpty && player.isCommandAvailable(COMMAND_SEEK_TO_NEXT_MEDIA_ITEM)) {
-            try {
-                player.seekToNext()
-                player.prepare()
-                player.playWhenReady = true
-            } catch (e: Exception) {
+        if (isCasting.value) {
+            player.seekToNext()
+        } else {
+            if (!player.currentTimeline.isEmpty && player.isCommandAvailable(COMMAND_SEEK_TO_NEXT_MEDIA_ITEM)) {
+                try {
+                    player.seekToNext()
+                    player.prepare()
+                    player.playWhenReady = true
+                } catch (e: Exception) {
+                }
             }
         }
     }
 
     fun seekToPrevious() {
-        if (!player.currentTimeline.isEmpty && player.isCommandAvailable(COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM)) {
-            try {
-                player.seekToPrevious()
-                player.prepare()
-                player.playWhenReady = true
-            } catch (e: Exception) {
+        if (isCasting.value) {
+            player.seekToPrevious()
+        } else {
+            if (!player.currentTimeline.isEmpty && player.isCommandAvailable(COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM)) {
+                try {
+                    player.seekToPrevious()
+                    player.prepare()
+                    player.playWhenReady = true
+                } catch (e: Exception) {
+                }
             }
         }
     }
@@ -145,14 +238,41 @@ class PlayerConnection(
         playWhenReady.value = newPlayWhenReady
     }
 
+    private fun triggerRemoteLoad(mediaItem: MediaItem?) {
+        val mediaId = mediaItem?.mediaId ?: return
+        scope.launch {
+            val url = service.resolveStreamUrl(mediaId)
+            val contentType = service.currentContentType
+            val metadata = mediaItem.metadata?.let {
+                Metadata(
+                    title = "${it.title} - ${it.artists.joinToString(", ") { a -> a.name }}",
+                    thumbnailUrl = it.thumbnailUrl
+                )
+            }
+            if (url != null && contentType != null) {
+                service.discoveryHandler.load(url, contentType, metadata)
+            }
+        }
+    }
+
     override fun onMediaItemTransition(
+
         mediaItem: MediaItem?,
         reason: Int,
     ) {
+        Log.d("FCast", "onMediaItemTransition reason=$reason isCasting=${isCasting.value}")
+        lastTransitionTime = System.currentTimeMillis()
         mediaMetadata.value = mediaItem?.metadata
         currentMediaItemIndex.value = player.currentMediaItemIndex
         currentWindowIndex.value = player.getCurrentQueueIndex()
         updateCanSkipPreviousAndNext()
+
+        if (isCasting.value && (reason == Player.MEDIA_ITEM_TRANSITION_REASON_SEEK ||
+                               reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO ||
+                               reason == Player.MEDIA_ITEM_TRANSITION_REASON_REPEAT)) {
+            player.pause() // Stop local playback immediately
+            triggerRemoteLoad(mediaItem)
+        }
     }
 
     override fun onTimelineChanged(

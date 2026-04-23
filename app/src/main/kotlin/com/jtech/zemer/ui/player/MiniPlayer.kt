@@ -37,6 +37,9 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Cast
+import androidx.compose.material.icons.filled.CastConnected
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -48,6 +51,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
@@ -64,6 +68,7 @@ import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntOffset
@@ -85,6 +90,7 @@ import com.jtech.zemer.extensions.togglePlayPause
 import com.jtech.zemer.models.MediaMetadata
 import com.jtech.zemer.utils.rememberPreference
 import kotlinx.coroutines.launch
+import org.fcast.sender_sdk.Metadata
 import kotlin.math.absoluteValue
 import kotlin.math.roundToInt
 
@@ -162,6 +168,12 @@ private fun NewMiniPlayer(
     val canSkipNext by playerConnection.canSkipNext.collectAsState()
     val canSkipPrevious by playerConnection.canSkipPrevious.collectAsState()
 
+    val currentService = playerConnection.service
+    val discoveredDevices = currentService.discoveryHandler.discoveredDevices
+    val devices = discoveredDevices.values.toList()
+    val connectedDevice = currentService.discoveryHandler.connectedDevice
+    var showCastSheet by remember { mutableStateOf(false) }
+
     LocalView.current
     val layoutDirection = LocalLayoutDirection.current
     val coroutineScope = rememberCoroutineScope()
@@ -207,6 +219,39 @@ private fun NewMiniPlayer(
         return (600 / (1f + kotlin.math.exp(-(-11.44748 * swipeSensitivity + 9.04945)))).roundToInt()
     }
     val autoSwipeThreshold = calculateAutoSwipeThreshold(swipeSensitivity)
+
+    if (showCastSheet) {
+        CastBottomSheet(
+            devices = devices,
+            connectedDevice = connectedDevice,
+            streamUrl = currentService.currentStreamUrl,
+            contentType = currentService.currentContentType,
+            metadata = mediaMetadata?.let {
+                Metadata(
+                    title = "${it.title} - ${it.artists.joinToString(", ") { a -> a.name }}",
+                    thumbnailUrl = it.thumbnailUrl
+                )
+            },
+            onDeviceSelected = { deviceInfo, url, type, metadata ->
+                currentService.discoveryHandler.connectTo(
+                    deviceInfo = deviceInfo,
+                    streamUrl = url,
+                    contentType = type,
+                    metadata = metadata,
+                    resumePosition = playerConnection.player.currentPosition / 1000.0,
+                    onTrackEnded = {
+                        playerConnection.seekToNext()
+                        playerConnection.player.play()
+                    }
+                )
+                playerConnection.player.pause()
+            },
+            onDisconnect = {
+                currentService.discoveryHandler.disconnect()
+            },
+            onDismiss = { showCastSheet = false }
+        )
+    }
 
     Box(
         modifier = modifier
@@ -262,9 +307,9 @@ private fun NewMiniPlayer(
                                     val isRightSwipe = currentOffset > 0
 
                                     if (isRightSwipe && canSkipPrevious) {
-                                        playerConnection.player.seekToPreviousMediaItem()
+                                        playerConnection.seekToPrevious()
                                     } else if (!isRightSwipe && canSkipNext) {
-                                        playerConnection.player.seekToNext()
+                                        playerConnection.seekToNext()
                                     }
                                 }
 
@@ -350,7 +395,7 @@ private fun NewMiniPlayer(
                                     playerConnection.player.seekTo(0, 0)
                                     playerConnection.player.playWhenReady = true
                                 } else {
-                                    playerConnection.player.togglePlayPause()
+                                    playerConnection.playPause()
                                 }
                             }
                     ) {
@@ -452,6 +497,42 @@ private fun NewMiniPlayer(
                                 overflow = TextOverflow.Ellipsis,
                             )
                         }
+                    }
+                }
+
+                if (devices.isNotEmpty()) {
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Box(
+                        contentAlignment = Alignment.Center,
+                        modifier = Modifier
+                            .size(40.dp)
+                            .clip(CircleShape)
+                            .border(
+                                width = 1.dp,
+                                color = if (connectedDevice != null)
+                                    MaterialTheme.colorScheme.primary.copy(alpha = 0.5f)
+                                else
+                                    MaterialTheme.colorScheme.outline.copy(alpha = 0.3f),
+                                shape = CircleShape
+                            )
+                            .background(
+                                color = if (connectedDevice != null)
+                                    MaterialTheme.colorScheme.primary.copy(alpha = 0.1f)
+                                else
+                                    Color.Transparent,
+                                shape = CircleShape
+                            )
+                            .clickable { showCastSheet = true }
+                    ) {
+                        Icon(
+                            imageVector = if (connectedDevice != null) Icons.Default.CastConnected else Icons.Default.Cast,
+                            contentDescription = stringResource(R.string.cast_button_description),
+                            tint = if (connectedDevice != null)
+                                MaterialTheme.colorScheme.primary
+                            else
+                                MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f),
+                            modifier = Modifier.size(20.dp)
+                        )
                     }
                 }
 
@@ -605,6 +686,12 @@ private fun LegacyMiniPlayer(
     val canSkipNext by playerConnection.canSkipNext.collectAsState()
     val canSkipPrevious by playerConnection.canSkipPrevious.collectAsState()
 
+    val currentService = playerConnection.service
+    val discoveredDevices = currentService.discoveryHandler.discoveredDevices
+    val devices = discoveredDevices.values.toList()
+    val connectedDevice = currentService.discoveryHandler.connectedDevice
+    var showCastSheet by remember { mutableStateOf(false) }
+
     LocalView.current
     val layoutDirection = LocalLayoutDirection.current
     val coroutineScope = rememberCoroutineScope()
@@ -629,6 +716,39 @@ private fun LegacyMiniPlayer(
         return (600 / (1f + kotlin.math.exp(-(-11.44748 * swipeSensitivity + 9.04945)))).roundToInt()
     }
     val autoSwipeThreshold = calculateAutoSwipeThreshold(swipeSensitivity)
+
+    if (showCastSheet) {
+        CastBottomSheet(
+            devices = devices,
+            connectedDevice = connectedDevice,
+            streamUrl = currentService.currentStreamUrl,
+            contentType = currentService.currentContentType,
+            metadata = mediaMetadata?.let {
+                Metadata(
+                    title = "${it.title} - ${it.artists.joinToString(", ") { a -> a.name }}",
+                    thumbnailUrl = it.thumbnailUrl
+                )
+            },
+            onDeviceSelected = { deviceInfo, url, type, metadata ->
+                currentService.discoveryHandler.connectTo(
+                    deviceInfo = deviceInfo,
+                    streamUrl = url,
+                    contentType = type,
+                    metadata = metadata,
+                    resumePosition = playerConnection.player.currentPosition / 1000.0,
+                    onTrackEnded = {
+                        playerConnection.seekToNext()
+                        playerConnection.player.play()
+                    }
+                )
+                playerConnection.player.pause()
+            },
+            onDisconnect = {
+                currentService.discoveryHandler.disconnect()
+            },
+            onDismiss = { showCastSheet = false }
+        )
+    }
 
     Box(
         modifier = modifier
@@ -699,9 +819,9 @@ private fun LegacyMiniPlayer(
                                     val isRightSwipe = currentOffset > 0
 
                                     if (isRightSwipe && canSkipPrevious) {
-                                        playerConnection.player.seekToPreviousMediaItem()
+                                        playerConnection.seekToPrevious()
                                     } else if (!isRightSwipe && canSkipNext) {
-                                        playerConnection.player.seekToNext()
+                                        playerConnection.seekToNext()
                                     }
                                 }
 
@@ -745,13 +865,25 @@ private fun LegacyMiniPlayer(
                 }
             }
 
+            if (devices.isNotEmpty()) {
+                IconButton(
+                    onClick = { showCastSheet = true },
+                ) {
+                    Icon(
+                        imageVector = if (connectedDevice != null) Icons.Default.CastConnected else Icons.Default.Cast,
+                        contentDescription = stringResource(R.string.cast_button_description),
+                        tint = if (connectedDevice != null) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f),
+                    )
+                }
+            }
+
             IconButton(
                 onClick = {
                     if (playbackState == Player.STATE_ENDED) {
                         playerConnection.player.seekTo(0, 0)
                         playerConnection.player.playWhenReady = true
                     } else {
-                        playerConnection.player.togglePlayPause()
+                        playerConnection.playPause()
                     }
                 },
             ) {

@@ -40,6 +40,9 @@ import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Cast
+import androidx.compose.material.icons.filled.CastConnected
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -89,6 +92,7 @@ import androidx.media3.common.Player
 import androidx.media3.common.Timeline
 import androidx.media3.exoplayer.source.ShuffleOrder.DefaultShuffleOrder
 import androidx.navigation.NavController
+import com.jtech.zemer.LocalDatabase
 import com.jtech.zemer.LocalPlayerConnection
 import com.jtech.zemer.R
 import com.jtech.zemer.constants.ListItemHeight
@@ -114,6 +118,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import org.fcast.sender_sdk.Metadata
 import sh.calvin.reorderable.ReorderableItem
 import sh.calvin.reorderable.rememberReorderableLazyListState
 import kotlin.math.roundToInt
@@ -346,6 +351,61 @@ fun Queue(
                                 .size(iconSize)
                                 .alpha(if (repeatMode == Player.REPEAT_MODE_OFF) 0.5f else 1f),
                             tint = TextBackgroundColor
+                        )
+                    }
+                    val service = playerConnection.service
+                    val devices = service.discoveryHandler.discoveredDevices.values.toList()
+                    val isCasting by playerConnection.isCasting.collectAsState()
+                    var showCastSheet by remember { mutableStateOf(false) }
+
+                    if (devices.isNotEmpty()) {
+                        Box(
+                            modifier = Modifier
+                                .size(buttonSize)
+                                .clip(RoundedCornerShape(5.dp))
+                                .border(1.dp, borderColor, RoundedCornerShape(5.dp))
+                                .clickable { showCastSheet = true },
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(
+                                imageVector = if (isCasting) Icons.Default.CastConnected else Icons.Default.Cast,
+                                contentDescription = stringResource(R.string.cast_button_description),
+                                modifier = Modifier.size(iconSize),
+                                tint = if (isCasting) MaterialTheme.colorScheme.primary else TextBackgroundColor
+                            )
+                        }
+                    }
+
+                    if (showCastSheet) {
+                        CastBottomSheet(
+                            devices = devices,
+                            connectedDevice = service.discoveryHandler.connectedDevice,
+                            streamUrl = service.currentStreamUrl,
+                            contentType = service.currentContentType,
+                            metadata = mediaMetadata?.let {
+                                Metadata(
+                                    title = "${it.title} - ${it.artists.joinToString(", ") { a -> a.name }}",
+                                    thumbnailUrl = it.thumbnailUrl
+                                )
+                            },
+                            onDeviceSelected = { deviceInfo, url, type, metadata ->
+                                playerConnection.player.pause()
+                                service.discoveryHandler.connectTo(
+                                    deviceInfo = deviceInfo,
+                                    streamUrl = url,
+                                    contentType = type,
+                                    metadata = metadata,
+                                    resumePosition = playerConnection.player.currentPosition / 1000.0,
+                                    onTrackEnded = {
+                                        playerConnection.seekToNext()
+                                        playerConnection.player.play()
+                                    }
+                                )
+                            },
+                            onDisconnect = {
+                                service.discoveryHandler.disconnect()
+                            },
+                            onDismiss = { showCastSheet = false }
                         )
                     }
 

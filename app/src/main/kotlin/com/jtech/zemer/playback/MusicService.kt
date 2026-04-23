@@ -158,6 +158,7 @@ import java.util.concurrent.Executor
 import java.time.LocalDateTime
 import javax.inject.Inject
 import kotlin.time.Duration.Companion.seconds
+import org.fcast.sender_sdk.*
 
 @OptIn(ExperimentalCoroutinesApi::class, FlowPreview::class)
 @AndroidEntryPoint
@@ -181,6 +182,9 @@ class MusicService :
 
     @Inject
     lateinit var mediaLibrarySessionCallback: MediaLibrarySessionCallback
+
+    private lateinit var deviceDiscoverer: NsdDeviceDiscoverer
+    val discoveryHandler = FCastDiscoveryHandler()
 
     private lateinit var audioManager: AudioManager
     private var audioFocusRequest: AudioFocusRequest? = null
@@ -239,6 +243,12 @@ class MusicService :
 
     val automixItems = MutableStateFlow<List<MediaItem>>(emptyList())
 
+    val currentStreamUrl: String?
+        get() = player.currentMediaItem?.mediaId?.let { songUrlCache[it]?.first }
+
+    val currentContentType: String?
+        get() = player.audioFormat?.sampleMimeType ?: "audio/mp4"
+
     private var consecutivePlaybackErr = 0
 
     // Use shared URL cache from DownloadUtil for consistency between playback and downloads
@@ -246,6 +256,7 @@ class MusicService :
 
     override fun onCreate() {
         super.onCreate()
+        deviceDiscoverer = NsdDeviceDiscoverer(this, discoveryHandler)
         // Media3's MediaLibraryService handles foreground notification automatically
         setMediaNotificationProvider(
             DefaultMediaNotificationProvider(
@@ -1064,6 +1075,27 @@ class MusicService :
         )
     }
 
+    suspend fun resolveStreamUrl(mediaId: String): String? {
+        songUrlCache[mediaId]?.takeIf { it.second > System.currentTimeMillis() }?.let {
+            return it.first
+        }
+
+        return withContext(Dispatchers.IO) {
+            val playbackData = YTPlayerUtils.playerResponseForPlayback(
+                mediaId,
+                audioQuality = audioQuality,
+                connectivityManager = connectivityManager,
+            ).getOrNull()
+
+            val streamUrl = playbackData?.streamUrl
+            if (streamUrl != null) {
+                songUrlCache[mediaId] =
+                    streamUrl to System.currentTimeMillis() + (playbackData.streamExpiresInSeconds * 1000L)
+            }
+            streamUrl
+        }
+    }
+
     override fun onMediaItemTransition(
         mediaItem: MediaItem?,
         reason: Int,
@@ -1431,7 +1463,7 @@ class MusicService :
             !dataStore.get(PauseListenHistoryKey, false)
         ) {
             database.query {
-                incrementTotalPlayTime(mediaItem.mediaId, playbackStats.totalPlayTimeMs)
+                incrementTotalPlayTime(songId = mediaItem.mediaId, playTime = playbackStats.totalPlayTimeMs)
                 try {
                     insert(
                         Event(
